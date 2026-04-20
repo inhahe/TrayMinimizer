@@ -39,6 +39,7 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tray_min
 # WinEvent constants
 EVENT_OBJECT_SHOW = 0x8002
 EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_SYSTEM_MINIMIZESTART = 0x0016
 WINEVENT_OUTOFCONTEXT = 0x0000
 WINEVENT_SKIPOWNPROCESS = 0x0002
 OBJID_WINDOW = 0
@@ -206,6 +207,9 @@ class TrayMinimizer:
         self._hook_proc = WinEventProcType(self._win_event_callback)
         self._hooks = []
         self._launched_procs = []  # Popen objects from launch mode
+        # Windows that were restored but should re-hide when minimized.
+        # hwnd -> {"title", "exe", "pid"}
+        self._watched_hwnds = {}
 
     # ── Config ────────────────────────────────────────────────────────
 
@@ -282,8 +286,10 @@ class TrayMinimizer:
         except Exception:
             pass
         with self.lock:
-            self.hidden_windows.pop(hwnd, None)
-            self.known_hwnds.discard(hwnd)
+            info = self.hidden_windows.pop(hwnd, None)
+            # Remember this window so we re-hide it if the user minimizes it.
+            if info:
+                self._watched_hwnds[hwnd] = info
         self._update_menu()
 
     def _restore_all(self):
@@ -441,6 +447,20 @@ class TrayMinimizer:
             return
         if not hwnd:
             return
+
+        # Re-hide a restored window when the user minimizes it.
+        if event == EVENT_SYSTEM_MINIMIZESTART:
+            with self.lock:
+                info = self._watched_hwnds.pop(hwnd, None)
+            if info:
+                threading.Timer(
+                    0.15, self._hide_window,
+                    args=(hwnd,),
+                    kwargs={"exe_override": info["exe"],
+                            "pid_override": info["pid"]},
+                ).start()
+            return
+
         if hwnd in self.known_hwnds:
             return
         if not self._is_app_window(hwnd):
@@ -466,7 +486,12 @@ class TrayMinimizer:
             0, self._hook_proc, 0, 0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
-        self._hooks = [hook1, hook2]
+        hook3 = user32.SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART,
+            0, self._hook_proc, 0, 0,
+            WINEVENT_OUTOFCONTEXT,  # no SKIPOWNPROCESS — we need our own windows
+        )
+        self._hooks = [hook1, hook2, hook3]
 
         msg = ctypes.wintypes.MSG()
         while self.running:
@@ -624,6 +649,9 @@ class TrayMinimizer:
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     def _exit(self):
+        # Clear watched set first so _restore_all doesn't re-add them.
+        with self.lock:
+            self._watched_hwnds.clear()
         self._restore_all()
         self.running = False
         for hook in self._hooks:
@@ -632,7 +660,7 @@ class TrayMinimizer:
         if self.icon:
             self.icon.stop()
 
-    def run(self, launch_cmd=None):
+    def run(self, launch_cmd=None, tray_name=None):
         self._launch_mode = launch_cmd is not None
 
         if self._launch_mode:
@@ -666,10 +694,10 @@ class TrayMinimizer:
         if launch_cmd:
             exe_icon = _extract_exe_icon(launch_cmd[0])
             icon_image = exe_icon or self._create_icon_image()
-            icon_title = f"Tray Minimizer — {os.path.basename(launch_cmd[0])}"
+            icon_title = tray_name or f"Tray Minimizer — {os.path.basename(launch_cmd[0])}"
         else:
             icon_image = self._create_icon_image()
-            icon_title = "Tray Minimizer"
+            icon_title = tray_name or "Tray Minimizer"
 
         # Run tray icon on main thread (blocks)
         self.icon = pystray.Icon(
@@ -695,10 +723,17 @@ def _log(msg):
 if __name__ == "__main__":
     _log(f"started, argv={sys.argv}")
     try:
+        # Parse optional --name flag
+        args = sys.argv[1:]
+        tray_name = None
+        if len(args) >= 2 and args[0] == "--name":
+            tray_name = args[1]
+            args = args[2:]
+
         minimizer = TrayMinimizer()
-        if len(sys.argv) > 1:
-            _log(f"launch mode: {sys.argv[1:]}")
-            minimizer.run(launch_cmd=sys.argv[1:])
+        if args:
+            _log(f"launch mode: {args}, name={tray_name}")
+            minimizer.run(launch_cmd=args, tray_name=tray_name)
         else:
             _log("watch mode")
             minimizer.run()
