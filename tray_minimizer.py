@@ -278,13 +278,54 @@ class TrayMinimizer:
             }
         self._update_menu()
 
-    def _restore_window(self, hwnd):
+    def _force_foreground(self, hwnd):
+        """Show a hidden/minimized window and forcibly bring it to the front.
+
+        A plain SetForegroundWindow() silently fails when our process does not
+        own the foreground (Windows' foreground-lock).  The window then gets
+        shown *behind* whatever is currently focused (e.g. a fullscreen
+        browser) and the user thinks "nothing happened".  Attaching our input
+        queue to the current foreground thread lifts the lock so the restore
+        actually surfaces the window.
+        """
         try:
             win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            win32gui.SetForegroundWindow(hwnd)
         except Exception:
             pass
+        try:
+            cur_tid = kernel32.GetCurrentThreadId()
+            fg = win32gui.GetForegroundWindow()
+            fg_tid = win32process.GetWindowThreadProcessId(fg)[0] if fg else 0
+            tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+            attached = []
+            for tid in {fg_tid, tgt_tid}:
+                if tid and tid != cur_tid and user32.AttachThreadInput(cur_tid, tid, True):
+                    attached.append(tid)
+            try:
+                win32gui.BringWindowToTop(hwnd)
+                win32gui.SetForegroundWindow(hwnd)
+                win32gui.SetActiveWindow(hwnd)
+            finally:
+                for tid in attached:
+                    user32.AttachThreadInput(cur_tid, tid, False)
+        except Exception:
+            pass
+
+    def _restore_window(self, hwnd):
+        # Self-heal: if the backing process has exited its window handle is
+        # dead, so "restoring" would silently do nothing and leave a zombie
+        # entry in the tray.  Prune it instead.
+        if not win32gui.IsWindow(hwnd):
+            with self.lock:
+                self.hidden_windows.pop(hwnd, None)
+                self._watched_hwnds.pop(hwnd, None)
+            self.known_hwnds.discard(hwnd)
+            _log(f"restore: hwnd={hwnd} is no longer a valid window; pruned")
+            self._update_menu()
+            return
+
+        self._force_foreground(hwnd)
         with self.lock:
             info = self.hidden_windows.pop(hwnd, None)
             # Remember this window so we re-hide it if the user minimizes it.
@@ -720,8 +761,35 @@ def _log(msg):
     except Exception:
         pass
 
+USAGE = """\
+TrayMinimizer - hide application windows to the Windows system tray.
+
+Usage:
+  tray_minimizer.py                       Watch mode: auto-hide configured apps.
+  tray_minimizer.py [--name NAME] PROG [ARGS...]
+                                          Launch mode: run PROG hidden in the
+                                          tray.  NAME sets the tray tooltip.
+
+Options:
+  -h, --help, /?   Show this help and exit.
+  --name NAME      Tray tooltip / title for the launched program.
+
+Examples:
+  tray_minimizer.py                       (watch mode; configure via tray menu)
+  tray_minimizer.py notepad.exe
+  tray_minimizer.py --name "my bot" cmd /c python bot.py
+"""
+
 if __name__ == "__main__":
     _log(f"started, argv={sys.argv}")
+
+    # Help must be handled BEFORE anything enters launch mode.  Otherwise
+    # "--help" is treated as a program to launch, and launch mode hides and
+    # detaches our own console — making the window vanish instead of printing.
+    if any(a in ("-h", "--help", "/?", "/h") for a in sys.argv[1:2]):
+        print(USAGE)
+        sys.exit(0)
+
     try:
         # Parse optional --name flag
         args = sys.argv[1:]
@@ -736,7 +804,20 @@ if __name__ == "__main__":
             minimizer.run(launch_cmd=args, tray_name=tray_name)
         else:
             _log("watch mode")
+            print(
+                "TrayMinimizer is running in watch mode (a tray icon is now "
+                "active).\nRight-click the tray icon to add/remove watched "
+                "apps, or choose Exit.\nThis console will stay open while it "
+                "runs; press Ctrl+C here to quit.",
+                flush=True,
+            )
             minimizer.run()
+    except KeyboardInterrupt:
+        _log("interrupted by user (Ctrl+C)")
+        try:
+            minimizer._exit()
+        except Exception:
+            pass
     except Exception as e:
         _log(f"CRASHED: {e}")
         import traceback

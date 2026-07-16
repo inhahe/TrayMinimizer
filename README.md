@@ -44,6 +44,15 @@ python tray_minimizer.py notepad.exe
 - **Right-click** for a menu with Restore All and Exit.
 - When the launched process exits, TrayMinimizer auto-exits.
 - Choosing Exit restores all hidden windows before quitting.
+- Restoring a window forcibly brings it to the foreground (it won't get stranded behind a fullscreen browser). If the window's process has already exited, the dead tray entry is pruned instead.
+
+## Help
+
+```
+python tray_minimizer.py --help
+```
+
+Prints usage and exits. (`-h`, `/?`, and `/h` also work.) Help is handled before launch mode, so it never hides or detaches the console.
 
 ## Watch Mode
 
@@ -52,6 +61,8 @@ Run TrayMinimizer with no arguments to start it as a background watcher.
 ```
 python tray_minimizer.py
 ```
+
+Watch mode keeps its console open and prints a status line so it's clear it's running (not hung). Press **Ctrl+C** in that console to quit, or use the tray menu's Exit.
 
 Right-click the tray icon to:
 - **Add App (type name)** — enter an exe name like `notepad.exe`
