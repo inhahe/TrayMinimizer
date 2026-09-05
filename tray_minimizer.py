@@ -47,6 +47,14 @@ OBJID_WINDOW = 0
 # Process creation flags
 CREATE_NEW_CONSOLE = 0x00000010
 
+# Windows whose title starts with this marker are NEVER auto-hidden to the
+# tray.  It lets a launched program keep a transient window visible while the
+# rest of it sits hidden in the tray.  orchestrator2's --resume/--copy session
+# picker sets this prefix on its own console window (via SetConsoleTitleW and
+# its Textual app title) so the picker stays on screen while the orchestrator2
+# server itself remains hidden.
+NO_HIDE_TITLE_PREFIX = "[nohide]"
+
 # Callback type for SetWinEventHook
 WinEventProcType = ctypes.WINFUNCTYPE(
     None,
@@ -137,29 +145,134 @@ def _snapshot_windows():
     return hwnds
 
 
-def _find_window_by_pid(pid, *, require_visible=True):
-    """Find a titled, top-level window owned by the given PID.
+# Window classes that are never a program's real window.  EnumWindows returns
+# *owned* top-level windows too, and every process that talks to a console gets
+# a 0x0, disabled "Default IME" helper window owned by conhost.exe.  Hiding one
+# of those produces a tray icon that restores nothing — the bug that used to
+# leave dozens of dead TrayMinimizer icons in the notification area.
+_PHANTOM_WINDOW_CLASSES = frozenset({
+    "ime",
+    "msctfime ui",
+    "default ime",
+    "tooltips_class32",
+    "sysshadow",
+    "workerw",
+    "progman",
+    "shell_traywnd",
+})
 
-    When *require_visible* is False the window may be hidden (SW_HIDE),
-    which is needed when we launch child processes born-hidden.
+WS_EX_NOACTIVATE = 0x08000000
+
+# A console window is the thing we want in the overwhelmingly common case
+# (launch mode wraps `cmd`), so it outranks any other candidate.
+_CONSOLE_WINDOW_CLASSES = frozenset({"consolewindowclass", "pseudoconsolewindow"})
+
+
+def _is_console_window(hwnd):
+    """True when *hwnd* is a console window (whoever hosts it)."""
+    try:
+        return win32gui.GetClassName(hwnd).lower() in _CONSOLE_WINDOW_CLASSES
+    except Exception:
+        return False
+
+
+def _window_is_restorable(hwnd, *, allow_hidden=False):
+    """True when *hwnd* is a genuine top-level window a user could restore.
+
+    *allow_hidden* exists because the two kinds of window we hide behave
+    differently under STARTUPINFO's SW_HIDE:
+
+    * A **console** window really is created hidden and stays that way, so
+      visibility can never be required for it.  That is safe because consoles
+      are identified by AttachConsole/GetConsoleWindow, which names the right
+      window outright rather than guessing.
+    * A **GUI** window has to be guessed at by PID, and toolkits leave
+      invisible helper windows lying around that are indistinguishable from a
+      real one by style alone — Tk's 1920x1015 "TtkMonitorWindow" has
+      WS_CAPTION, WS_SYSMENU, WS_THICKFRAME, no owner and no WS_EX_TOOLWINDOW.
+      What separates it from the real window is that it is never shown.  GUI
+      toolkits call ShowWindow themselves, so a real main window does become
+      visible even when the process was started with SW_HIDE (measured: Tk's
+      main window is visible, its monitor window is not).
+
+    So: consoles are exempt from the visibility test, GUI windows are not.
+    """
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        if style & win32con.WS_CHILD:
+            return False
+        if style & win32con.WS_DISABLED:
+            return False
+        if ex_style & win32con.WS_EX_TOOLWINDOW:
+            return False
+        if ex_style & WS_EX_NOACTIVATE:
+            return False
+        # An owned window (GetParent returns the owner for non-child windows)
+        # is a dialog/helper, not the program's main window.
+        if win32gui.GetParent(hwnd):
+            return False
+        if win32gui.GetClassName(hwnd).lower() in _PHANTOM_WINDOW_CLASSES:
+            return False
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        if right - left <= 0 or bottom - top <= 0:
+            return False
+        if (not allow_hidden
+                and not _is_console_window(hwnd)
+                and not win32gui.IsWindowVisible(hwnd)):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _window_rank(hwnd):
+    """Sort key for candidate windows — lower is better.
+
+    Console windows win, because launch mode nearly always wraps `cmd`.
+    """
+    return 0 if _is_console_window(hwnd) else 1
+
+
+def _describe_window(hwnd):
+    """Human-readable one-liner about a window, for the log."""
+    try:
+        _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+        return (f"hwnd={hwnd} cls={win32gui.GetClassName(hwnd)!r} "
+                f"title={win32gui.GetWindowText(hwnd)!r} pid={wpid}")
+    except Exception:
+        return f"hwnd={hwnd} <unreadable>"
+
+
+def _find_window_by_pid(pid):
+    """Find the best real top-level window owned by the given PID, or None.
+
+    Hidden windows are accepted (launch mode's child is born SW_HIDE); the
+    _window_is_restorable() gate is what keeps phantoms out.
     """
     result = []
     def cb(hwnd, _):
-        if require_visible and not win32gui.IsWindowVisible(hwnd):
-            return
-        if not win32gui.GetWindowText(hwnd):
-            return
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if ex_style & win32con.WS_EX_TOOLWINDOW:
-            return
-        _, wpid = win32process.GetWindowThreadProcessId(hwnd)
-        if wpid == pid:
+        try:
+            if not win32gui.GetWindowText(hwnd):
+                return
+            _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+            if wpid != pid:
+                return
+            if not _window_is_restorable(hwnd):
+                return
             result.append(hwnd)
+        except Exception:
+            pass
     try:
         win32gui.EnumWindows(cb, None)
     except Exception:
         pass
-    return result[0] if result else None
+    if not result:
+        return None
+    result.sort(key=_window_rank)
+    return result[0]
 
 
 def _get_process_tree_pids(root_pid):
@@ -196,10 +309,38 @@ def _find_console_hwnd(pid):
         return hwnd
 
 
+def _title_is_no_hide(hwnd):
+    """True when the window's title marks it as never-hide.
+
+    See NO_HIDE_TITLE_PREFIX.  A window can set this after it's created
+    (SetConsoleTitleW / a TUI setting its own title), so this is re-checked
+    at every hide decision rather than cached.
+    """
+    try:
+        title = win32gui.GetWindowText(hwnd)
+    except Exception:
+        return False
+    return bool(title) and title.startswith(NO_HIDE_TITLE_PREFIX)
+
+
 class TrayMinimizer:
+    # How long the authoritative AttachConsole probe gets to itself before the
+    # guessing strategies are allowed to run.  A console window takes a few
+    # tens of milliseconds to exist after CreateProcess; without this head
+    # start the fallbacks fire into that gap and can only find phantoms.
+    _FALLBACK_GRACE = 2.0
+    _WATCHDOG_INTERVAL = 10       # seconds between watchdog passes
+    _READOPT_TIMEOUT = 2.0        # per-pass budget when re-adopting a window
+    # Empty passes before the icon gives up.  Deliberately generous: giving up
+    # is right for a program that will never have a window, but wrong for one
+    # that is merely slow to show its first one, and only the passage of time
+    # tells those apart.
+    _MAX_EMPTY_CHECKS = 6
+
     def __init__(self):
         self.config = self._load_config()
-        self.hidden_windows = {}  # hwnd -> {"title", "exe", "pid", "process"}
+        # hwnd -> {"title", "exe", "pid", "launch_pid"}
+        self.hidden_windows = {}
         self.lock = threading.Lock()
         self.running = True
         self.icon = None
@@ -207,8 +348,19 @@ class TrayMinimizer:
         self._hook_proc = WinEventProcType(self._win_event_callback)
         self._hooks = []
         self._launched_procs = []  # Popen objects from launch mode
+        self._proc_exe_names = {}  # pid -> exe name, for re-adoption
+        self._launch_mode = False
+        # Console window inherited from our launcher, hidden in launch
+        # mode and handed back in _restore_own_console().
+        self._inherited_console_hwnd = None
+        # Set once launch-mode's first window search has finished, so the
+        # watchdog doesn't judge an icon before detection has had its say.
+        self._initial_detect_done = threading.Event()
+        # pystray rebuilds the native HMENU on every update; doing that from
+        # several threads at once corrupts it.
+        self._menu_lock = threading.Lock()
         # Windows that were restored but should re-hide when minimized.
-        # hwnd -> {"title", "exe", "pid"}
+        # hwnd -> {"title", "exe", "pid", "launch_pid"}
         self._watched_hwnds = {}
 
     # ── Config ────────────────────────────────────────────────────────
@@ -247,34 +399,58 @@ class TrayMinimizer:
             return None, None
 
     def _is_app_window(self, hwnd):
+        """Watch-mode test: a *visible* window worth auto-hiding.
+
+        Same phantom filtering as launch mode (_window_is_restorable), plus a
+        visibility requirement — in watch mode we react to windows appearing
+        on screen, so an invisible one is never a candidate.
+        """
         if not win32gui.IsWindowVisible(hwnd):
-            return False
-        if not win32gui.GetWindowText(hwnd):
             return False
         style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
         if not (style & win32con.WS_VISIBLE):
             return False
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if ex_style & win32con.WS_EX_TOOLWINDOW:
+        if not win32gui.GetWindowText(hwnd):
             return False
-        return True
+        return _window_is_restorable(hwnd)
 
-    def _hide_window(self, hwnd, exe_override=None, pid_override=None):
+    def _hide_window(self, hwnd, exe_override=None, launch_pid=None):
+        """Hide *hwnd* to the tray and record it.
+
+        *launch_pid* is the process we started in launch mode; it is tracked
+        separately from the window's real owner pid because the window often
+        belongs to a descendant (or to conhost.exe) rather than to the process
+        whose exit we are waiting on.
+        """
         if not win32gui.IsWindow(hwnd):
             return
+        # Never hide a window that has marked itself no-hide (e.g. the
+        # orchestrator2 session picker).  This is the single chokepoint every
+        # hide path funnels through, so the guard here covers launch-mode
+        # detection, the event hook, and the minimize re-hide alike.
+        if _title_is_no_hide(hwnd):
+            _log(f"skip hide: hwnd={hwnd} is marked no-hide")
+            return
+        # Last line of defence: never put a phantom (conhost's owned 0x0
+        # "Default IME" helper and friends) in the tray.  A tray entry that
+        # restores an invisible window is indistinguishable, to the user, from
+        # a tray icon that is simply broken.
+        if not _window_is_restorable(hwnd, allow_hidden=True):
+            _log(f"skip hide: not a restorable window — {_describe_window(hwnd)}")
+            return
         title = win32gui.GetWindowText(hwnd)
-        if exe_override:
-            exe, pid = exe_override, pid_override
-        else:
-            exe, pid = self._get_exe_for_hwnd(hwnd)
+        owner_exe, owner_pid = self._get_exe_for_hwnd(hwnd)
+        exe = exe_override or owner_exe
         if not exe:
             return
+        _log(f"hiding {_describe_window(hwnd)} exe={exe} launch_pid={launch_pid}")
         # Window may already be hidden (started with SW_HIDE); calling
         # ShowWindow(SW_HIDE) on an already-hidden window is a harmless no-op.
         win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
         with self.lock:
             self.hidden_windows[hwnd] = {
-                "title": title or exe, "exe": exe, "pid": pid,
+                "title": title or exe, "exe": exe,
+                "pid": owner_pid, "launch_pid": launch_pid,
             }
         self._update_menu()
 
@@ -331,6 +507,12 @@ class TrayMinimizer:
             # Remember this window so we re-hide it if the user minimizes it.
             if info:
                 self._watched_hwnds[hwnd] = info
+        try:
+            shown = win32gui.IsWindowVisible(hwnd)
+        except Exception:
+            shown = False
+        _log(f"restore: {_describe_window(hwnd)} -> "
+             f"{'visible' if shown else 'STILL NOT VISIBLE'}")
         self._update_menu()
 
     def _restore_all(self):
@@ -360,15 +542,18 @@ class TrayMinimizer:
             startupinfo=si,
         )
         self._launched_procs.append(proc)
+        self._proc_exe_names[proc.pid] = exe_name
 
         _log(f"launched pid={proc.pid} exe={exe_name}")
 
         # Start a thread to find and hide the window
-        threading.Thread(
-            target=self._find_and_hide_launched,
-            args=(proc, exe_name, before),
-            daemon=True,
-        ).start()
+        def detect():
+            try:
+                self._find_and_hide_launched(proc, exe_name, before)
+            finally:
+                self._initial_detect_done.set()
+
+        threading.Thread(target=detect, daemon=True).start()
 
         # Monitor the process — clean up tray entry and optionally exit when done
         threading.Thread(
@@ -377,82 +562,126 @@ class TrayMinimizer:
             daemon=True,
         ).start()
 
-    def _find_and_hide_launched(self, proc, exe_name, windows_before, timeout=15):
+    def _find_and_hide_launched(self, proc, exe_name, windows_before,
+                                timeout=20, quiet=False, grace=None):
         """Find the window created by a launched process and hide it.
 
-        The child was started with SW_HIDE, so visibility checks are skipped.
-        Strategies are ordered by reliability for console apps on Win 10/11:
+        Returns True when a window was found and hidden.
 
-        1. AttachConsole — works regardless of which process owns the actual
-           console window (conhost.exe, OpenConsole.exe, etc.).
-        2. GUI window search by PID — catches non-console (GUI) children.
-        3. Window-list diff — fallback that also handles conhost-owned windows
-           by verifying ownership through AttachConsole.
+        The child is started with SW_HIDE, so the window we are looking for is
+        legitimately invisible and visibility cannot be used as a filter.
+        Everything therefore hinges on picking the *right* window:
+
+        1. AttachConsole — authoritative.  GetConsoleWindow() names the exact
+           console window of the process, whoever owns it (conhost.exe,
+           OpenConsole.exe, ...).  This is the only strategy that cannot pick
+           the wrong window, so it is given a head start (_FALLBACK_GRACE)
+           before the guessing strategies are allowed to run at all.
+        2. Window search by PID — catches GUI children that have no console.
+        3. Window-list diff — catches windows owned by a console host process
+           that is not in our process tree.
+
+        Strategies 2 and 3 used to fire on the very first pass, microseconds
+        after CreateProcess, when the console window does not exist yet.  The
+        only window around at that instant is conhost's owned 0x0 "Default
+        IME" helper, which passed the old filters and got hidden in place of
+        the real console — producing a tray icon that restores nothing.  Both
+        now go through _window_is_restorable() and only after strategy 1 has
+        had its chance.
         """
         deadline = time.time() + timeout
+        # The head start only matters right after CreateProcess.  Re-adoption
+        # runs against a process that has been up for a while, so it passes
+        # grace=0 and may use every strategy immediately.
+        if grace is None:
+            grace = self._FALLBACK_GRACE
+        fallback_at = time.time() + grace
 
         while time.time() < deadline:
             if proc.poll() is not None:
-                return  # process already exited
+                if not quiet:
+                    _log(f"detect: pid={proc.pid} exited before a window appeared")
+                return False
 
-            # Refresh the process tree (children may spawn after launch)
+            # Refresh the process tree (children may spawn after launch).
+            # Sort, and probe the process we actually launched first, so the
+            # outcome does not depend on set iteration order.
             tree_pids = _get_process_tree_pids(proc.pid)
+            ordered_pids = [proc.pid] + sorted(tree_pids - {proc.pid})
 
-            # Strategy 1: AttachConsole — most reliable for console apps.
-            # GetConsoleWindow() returns the HWND regardless of visibility,
-            # and works even when the window is owned by conhost.exe.
-            for pid in tree_pids:
+            # ── Strategy 1: AttachConsole (authoritative) ──────────────
+            for pid in ordered_pids:
                 hwnd = _find_console_hwnd(pid)
-                if hwnd and hwnd not in self.known_hwnds and win32gui.IsWindow(hwnd):
-                    _log(f"found via AttachConsole: hwnd={hwnd} pid={pid}")
-                    self.known_hwnds.add(hwnd)
-                    self._hide_window(hwnd, exe_override=exe_name, pid_override=proc.pid)
-                    return
-
-            # Strategy 2: find a GUI window owned by any PID in the tree.
-            # Skip the IsWindowVisible filter — the window may be born hidden.
-            for pid in tree_pids:
-                hwnd = _find_window_by_pid(pid, require_visible=False)
-                if hwnd and hwnd not in self.known_hwnds:
-                    self.known_hwnds.add(hwnd)
-                    self._hide_window(hwnd, exe_override=exe_name, pid_override=proc.pid)
-                    return
-
-            # Strategy 3: diff the window list.  New windows may be owned by
-            # conhost.exe (not in tree_pids), so we verify via AttachConsole.
-            after = _snapshot_windows()
-            new_hwnds = after - windows_before
-            for hwnd in new_hwnds:
-                if hwnd in self.known_hwnds:
+                if not hwnd or hwnd in self.known_hwnds:
                     continue
                 if not win32gui.IsWindow(hwnd):
                     continue
-                # Don't require visibility — child was started hidden.
-                _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+                if _title_is_no_hide(hwnd):
+                    continue  # e.g. the orchestrator2 picker console
+                _log(f"detect: console probe matched {_describe_window(hwnd)} "
+                     f"(via pid={pid})")
+                self.known_hwnds.add(hwnd)
+                self._hide_window(hwnd, exe_override=exe_name,
+                                  launch_pid=proc.pid)
+                return True
 
-                # Direct PID match
-                if wpid in tree_pids:
+            if time.time() >= fallback_at:
+                # ── Strategy 2: a real window owned by the process tree ──
+                for pid in ordered_pids:
+                    hwnd = _find_window_by_pid(pid)
+                    if not hwnd or hwnd in self.known_hwnds:
+                        continue
+                    if _title_is_no_hide(hwnd):
+                        continue
+                    _log(f"detect: pid search matched {_describe_window(hwnd)}")
                     self.known_hwnds.add(hwnd)
-                    self._hide_window(hwnd, exe_override=exe_name, pid_override=proc.pid)
-                    return
+                    self._hide_window(hwnd, exe_override=exe_name,
+                                      launch_pid=proc.pid)
+                    return True
 
-                # The window might belong to conhost.exe / OpenConsole.exe
-                # hosting our child's console.  Verify by checking whether
-                # AttachConsole on our child PID yields this same HWND.
-                try:
-                    owner = psutil.Process(wpid)
-                    if owner.name().lower() in ("conhost.exe", "openconsole.exe"):
-                        verify_hwnd = _find_console_hwnd(proc.pid)
-                        if verify_hwnd == hwnd:
-                            self.known_hwnds.add(hwnd)
-                            self._hide_window(hwnd, exe_override=exe_name, pid_override=proc.pid)
-                            return
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
+                # ── Strategy 3: diff the window list ─────────────────────
+                new_hwnds = _snapshot_windows() - windows_before
+                candidates = []
+                for hwnd in new_hwnds:
+                    if hwnd in self.known_hwnds:
+                        continue
+                    if _title_is_no_hide(hwnd):
+                        continue  # leave marked windows (e.g. the picker) alone
+                    if not _window_is_restorable(hwnd):
+                        continue
+                    try:
+                        _, wpid = win32process.GetWindowThreadProcessId(hwnd)
+                    except Exception:
+                        continue
+                    if wpid in tree_pids:
+                        candidates.append(hwnd)
+                        continue
+                    # The window may belong to the conhost.exe /
+                    # OpenConsole.exe hosting our child's console.  Verify by
+                    # checking that AttachConsole on our child yields it.
+                    try:
+                        if psutil.Process(wpid).name().lower() in (
+                                "conhost.exe", "openconsole.exe"):
+                            if _find_console_hwnd(proc.pid) == hwnd:
+                                candidates.append(hwnd)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                if candidates:
+                    # Deterministic: console windows first, then by handle.
+                    candidates.sort(key=lambda h: (_window_rank(h), h))
+                    hwnd = candidates[0]
+                    _log(f"detect: window diff matched {_describe_window(hwnd)}")
+                    self.known_hwnds.add(hwnd)
+                    self._hide_window(hwnd, exe_override=exe_name,
+                                      launch_pid=proc.pid)
+                    return True
 
             time.sleep(0.2)
 
-        _log(f"WARNING: could not find window for {exe_name} within {timeout}s")
+        if not quiet:
+            _log(f"WARNING: could not find a window for {exe_name} "
+                 f"(pid={proc.pid}) within {timeout}s")
+        return False
 
     def _monitor_process(self, proc):
         """Wait for a launched process to exit, then clean up its tray entry."""
@@ -463,10 +692,15 @@ class TrayMinimizer:
 
         with self.lock:
             stale = [h for h, info in self.hidden_windows.items()
-                     if info.get("pid") == proc.pid or not win32gui.IsWindow(h)]
+                     if info.get("launch_pid") == proc.pid
+                     or not win32gui.IsWindow(h)]
             for h in stale:
                 del self.hidden_windows[h]
                 self.known_hwnds.discard(h)
+            for h in [h for h, info in self._watched_hwnds.items()
+                      if info.get("launch_pid") == proc.pid
+                      or not win32gui.IsWindow(h)]:
+                del self._watched_hwnds[h]
             # Decide whether to auto-exit while still holding the lock,
             # so another thread can't sneak a new entry in between.
             should_exit = (
@@ -498,13 +732,15 @@ class TrayMinimizer:
                     0.15, self._hide_window,
                     args=(hwnd,),
                     kwargs={"exe_override": info["exe"],
-                            "pid_override": info["pid"]},
+                            "launch_pid": info.get("launch_pid")},
                 ).start()
             return
 
         if hwnd in self.known_hwnds:
             return
         if not self._is_app_window(hwnd):
+            return
+        if _title_is_no_hide(hwnd):
             return
 
         apps = [a.lower() for a in self.config.get("apps", [])]
@@ -546,18 +782,82 @@ class TrayMinimizer:
             if hook:
                 user32.UnhookWinEvent(hook)
 
-    # ── Stale window cleanup ──────────────────────────────────────────
+    # ── Watchdog: no dead tray icons ──────────────────────────────────
 
-    def _cleanup_thread(self):
+    def _watchdog_thread(self):
+        """Keep the tray icon honest.
+
+        Prunes windows that no longer exist, and — in launch mode — makes sure
+        the icon never outlives its usefulness.  An icon whose window has been
+        destroyed while the launched process keeps running (a `cmd /K` whose
+        inner program exited, a GUI child that was closed) is exactly the
+        "tray icon that does nothing when I click it" the user sees.  When
+        that happens we re-run detection to adopt whatever window the process
+        does have now, and if it has none at all we stop, rather than sitting
+        in the notification area forever with nothing to show.
+        """
+        misses = 0
         while self.running:
-            time.sleep(10)
+            time.sleep(self._WATCHDOG_INTERVAL)
+            if not self.running:
+                return
+
             with self.lock:
-                stale = [h for h in self.hidden_windows if not win32gui.IsWindow(h)]
+                stale = [h for h in self.hidden_windows
+                         if not win32gui.IsWindow(h)]
                 for h in stale:
                     del self.hidden_windows[h]
                     self.known_hwnds.discard(h)
-            if stale:
+                stale_watched = [h for h in self._watched_hwnds
+                                 if not win32gui.IsWindow(h)]
+                for h in stale_watched:
+                    del self._watched_hwnds[h]
+                    self.known_hwnds.discard(h)
+                tracked = len(self.hidden_windows) + len(self._watched_hwnds)
+            if stale or stale_watched:
+                _log(f"watchdog: pruned {len(stale) + len(stale_watched)} "
+                     f"dead window(s)")
                 self._update_menu()
+
+            if not self._launch_mode or tracked:
+                misses = 0
+                continue
+
+            # Initial detection may still be searching (a program can take a
+            # while to put up its first window); don't pull the rug out.
+            if not self._initial_detect_done.is_set():
+                continue
+
+            # Launch mode with nothing tracked.  Try to (re-)adopt a window
+            # from any still-running launched process.
+            live = [p for p in self._launched_procs if p.poll() is None]
+            if not live:
+                # _monitor_process handles the all-exited case; if it somehow
+                # did not, do not linger.
+                continue
+            adopted = False
+            for proc in live:
+                if self._find_and_hide_launched(
+                        proc, self._exe_name_for(proc), set(),
+                        timeout=self._READOPT_TIMEOUT, quiet=True, grace=0):
+                    _log(f"watchdog: re-adopted a window for pid={proc.pid}")
+                    adopted = True
+                    break
+            if adopted:
+                misses = 0
+                continue
+
+            misses += 1
+            _log(f"watchdog: nothing to show for {misses} check(s) "
+                 f"({self._WATCHDOG_INTERVAL}s apart)")
+            if misses >= self._MAX_EMPTY_CHECKS:
+                _log("watchdog: launched process has no window to restore; "
+                     "exiting so a dead icon is not left in the tray")
+                self._exit()
+                return
+
+    def _exe_name_for(self, proc):
+        return self._proc_exe_names.get(proc.pid, "?")
 
     # ── Add / remove app dialogs ──────────────────────────────────────
 
@@ -670,9 +970,16 @@ class TrayMinimizer:
         if not watching:
             watching.append(pystray.MenuItem("(none)", None, enabled=False))
 
-        return pystray.Menu(
+        items = [
             pystray.MenuItem("Hidden Windows", pystray.Menu(*hidden_items)),
             pystray.MenuItem("Restore All", lambda icon, item: self._restore_all(), default=True),
+        ]
+        if self._launch_mode:
+            # `cmd /K` outlives the program it ran, so without this the only
+            # way to clear the icon is Task Manager.
+            items.append(pystray.MenuItem(
+                "Quit Program", lambda icon, item: self._kill_launched()))
+        items += [
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Add App (type name)...", lambda icon, item: self._add_app_dialog()),
             pystray.MenuItem("Add App (pick running)...", lambda icon, item: self._pick_running_app_dialog()),
@@ -680,20 +987,84 @@ class TrayMinimizer:
             pystray.MenuItem("Watching", pystray.Menu(*watching)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", lambda icon, item: self._exit()),
-        )
+        ]
+        return pystray.Menu(*items)
 
     def _update_menu(self):
-        if self.icon:
-            self.icon.menu = self._build_menu()
-            self.icon.update_menu()
+        # Serialised: pystray's win32 backend destroys and recreates the
+        # native HMENU here, and concurrent rebuilds from the detection,
+        # monitor and watchdog threads would leave a dangling handle.
+        with self._menu_lock:
+            if self.icon:
+                try:
+                    self.icon.menu = self._build_menu()
+                    self.icon.update_menu()
+                except Exception as e:
+                    _log(f"menu update failed: {e}")
 
     # ── Lifecycle ─────────────────────────────────────────────────────
+
+    def _kill_launched(self):
+        """Terminate the launched process tree, then exit.
+
+        The tray icon stands for "my program, running hidden".  When the user
+        says quit, the program should actually stop — leaving a stray `cmd /K`
+        behind is what stacks up unkillable icons in the notification area.
+        """
+        for proc in self._launched_procs:
+            if proc.poll() is not None:
+                continue
+            try:
+                parent = psutil.Process(proc.pid)
+            except psutil.NoSuchProcess:
+                continue
+            children = []
+            try:
+                children = parent.children(recursive=True)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            for victim in children + [parent]:
+                try:
+                    _log(f"quit program: terminating pid={victim.pid} "
+                         f"({victim.name()})")
+                    victim.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            _, alive = psutil.wait_procs(children + [parent], timeout=3)
+            for victim in alive:
+                try:
+                    victim.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        self._exit()
+
+    def _restore_own_console(self):
+        """Un-hide the console we inherited from our launcher.
+
+        Only matters when the launcher outlives us — an interactive
+        `cmd /K ... tray_minimizer.py ...`.  Then that shell is still sitting
+        at a prompt behind a window we hid, and if we exit without showing it
+        again it becomes invisible and unreachable forever.  When the launcher
+        already exited (the documented `start "" /MIN` form) the hwnd is dead
+        and ShowWindow is a harmless no-op.
+        """
+        hwnd = self._inherited_console_hwnd
+        if not hwnd:
+            return
+        self._inherited_console_hwnd = None
+        try:
+            if win32gui.IsWindow(hwnd) and not win32gui.IsWindowVisible(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                _log(f"restored our launcher's console window hwnd={hwnd}")
+        except Exception as e:
+            _log(f"could not restore launcher console: {e}")
 
     def _exit(self):
         # Clear watched set first so _restore_all doesn't re-add them.
         with self.lock:
             self._watched_hwnds.clear()
         self._restore_all()
+        self._restore_own_console()
         self.running = False
         for hook in self._hooks:
             if hook:
@@ -713,8 +1084,22 @@ class TrayMinimizer:
             # Hide it and then fully detach.  This also eliminates the
             # FreeConsole/AttachConsole tug-of-war with the detection threads
             # (fixing the "random characters" bug).
+            #
+            # The hwnd is remembered so _restore_own_console() can give it back
+            # on the way out.  It is not ours to keep: when the launcher is an
+            # interactive shell (`cmd /K ... tray_minimizer.py ...` rather than
+            # the documented `start "" /MIN ...`), that shell survives us, and
+            # leaving its window hidden strands it as an invisible, immortal
+            # prompt with no way to reach it.  Twenty-nine of those had piled
+            # up before this was fixed.
             own_hwnd = kernel32.GetConsoleWindow()
-            if own_hwnd:
+            if own_hwnd and win32gui.IsWindowVisible(int(own_hwnd)):
+                # Only remember a window we actually changed.  Under a ConPTY
+                # (Windows Terminal, or a parent that is itself a pseudo
+                # console) GetConsoleWindow() returns a hidden 0x0
+                # PseudoConsoleWindow that was never on screen; "restoring"
+                # that on exit would pop a bogus empty window into existence.
+                self._inherited_console_hwnd = int(own_hwnd)
                 win32gui.ShowWindow(int(own_hwnd), win32con.SW_HIDE)
             kernel32.FreeConsole()
 
@@ -723,7 +1108,7 @@ class TrayMinimizer:
         hook_thread.start()
 
         # Start cleanup thread
-        cleanup_thread = threading.Thread(target=self._cleanup_thread, daemon=True)
+        cleanup_thread = threading.Thread(target=self._watchdog_thread, daemon=True)
         cleanup_thread.start()
 
         # If launch mode, launch the program and hide it
@@ -748,7 +1133,12 @@ class TrayMinimizer:
             self._build_menu(),
         )
         _log("starting icon.run()")
-        self.icon.run()
+        try:
+            self.icon.run()
+        finally:
+            # Covers every way out of the message loop, including ones that
+            # never go through _exit().
+            self._restore_own_console()
         _log("icon.run() returned")
 
 
