@@ -130,3 +130,9 @@ hiding hwnd=4073044 cls='ConsoleWindowClass' title='C:\WINDOWS\SYSTEM32\cmd.exe'
 ```
 
 `skip hide:` lines record a window that was rejected and why; `watchdog:` lines record pruning, re-adoption and give-up decisions.
+
+
+## License
+
+MIT - see [LICENSE](LICENSE). Free to use, modify and redistribute; provided
+as-is, with no warranty.
