@@ -1,0 +1,15 @@
+
+# Local-only. We publish straight from this directory now instead of copying
+# a filtered subset into D:\github, so these are excluded here instead.
+build/
+__pycache__/
+.orchestrator_history
+build.bat
+cptogithub.bat
+design.md
+go.bat
+test_trayminimizer.py
+todo.txt
+*.exe
+*.log
+.claude/
